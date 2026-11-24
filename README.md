@@ -10,13 +10,12 @@ This version simplifies the codebase by removing the support for `--ssh`.
 1. Install it on your System.
 
     ```
-    cargo install -f --git https://github.com/busyjay/gpg-bridge
+    cargo install -f --locked --git https://github.com/cqjjjzr/gpg-bridge
     ```
 
     It's recommanded to build the binary yourself. In case you don't want to setup Rust environment,
-    you can also download a prebuilt binary from github action artifact. [Here][1] is an official guide
-    on how to download artifacts. The artifact is packaged for every commit, make sure download the
-    latest one.
+    you can also download a prebuilt binary from [GitHub Releases][2], or the artifact of any commit's
+    build workflow ([how to download artifacts][1]).
 
 2. Make sure you have setup gpg agent forward following [the guide](https://wiki.gnupg.org/AgentForwarding).
 
@@ -85,3 +84,4 @@ There are several gotchas if not using bridge to forward gpg agent on Windows. S
     customized connect step. So without extra tools, you can't really connect openssh-portable to GnuPG.
 
 [1]: https://docs.github.com/en/actions/managing-workflow-runs/downloading-workflow-artifacts
+[2]: https://github.com/cqjjjzr/gpg-bridge/releases
