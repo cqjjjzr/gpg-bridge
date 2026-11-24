@@ -1,6 +1,5 @@
 use clap::Parser;
 use log::{debug, error, warn};
-use std::convert::TryInto;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
