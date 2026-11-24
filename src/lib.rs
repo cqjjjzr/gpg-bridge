@@ -1,16 +1,20 @@
-use log::{debug, error, trace};
+use log::{debug, error, warn};
+use std::convert::TryInto;
 use std::path::Path;
 use std::sync::Arc;
-use std::{error, io, mem, ptr, str};
-use tokio::fs::File;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use std::time::Duration;
+use std::{io, str};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command;
 use tokio::sync::Mutex;
+use tokio::time::{sleep, timeout};
+
+type Nonce = (u16, [u8; 16]);
 
 struct AgentMeta {
     path: Option<String>,
-    args: Option<(u16, [u8; 16])>,
+    args: Option<Nonce>,
 }
 
 async fn load_gpg_socket_path() -> io::Result<String> {
@@ -20,15 +24,12 @@ async fn load_gpg_socket_path() -> io::Result<String> {
         .output()
         .await?;
     if !output.status.success() {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!(
-                "failed to load extra socket: {:?}",
-                String::from_utf8_lossy(&output.stderr)
-            ),
-        ));
+        return Err(io::Error::other(format!(
+            "failed to load extra socket: {:?}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
     }
-    Ok(String::from_utf8(output.stdout).unwrap().trim().to_owned())
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
 pub async fn ping_gpg_agent() -> io::Result<()> {
@@ -37,131 +38,115 @@ pub async fn ping_gpg_agent() -> io::Result<()> {
         .output()
         .await?;
     if !output.status.success() {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!(
-                "failed to start gpg-agent: {:?}",
-                String::from_utf8_lossy(&output.stderr)
-            ),
-        ));
+        return Err(io::Error::other(format!(
+            "failed to start gpg-agent: {:?}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
     }
     Ok(())
 }
 
-fn report_data_err(e: impl Into<Box<dyn error::Error + Send + Sync>>) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, e)
+fn data_err(msg: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, msg)
 }
 
-fn load_cygwin_port_nounce(buffer: &[u8]) -> io::Result<(u16, [u8; 16])> {
-    // "%u %c %08x-%08x-%08x-%08x\x00"
-    let find = |buffer: &[u8], start_pos: usize, delimeter| {
-        if buffer.len() <= start_pos {
-            return Err(report_data_err("buffer to short"));
-        }
-        match buffer[start_pos..].iter().position(|c| *c == delimeter) {
-            Some(pos) => Ok(pos),
-            None => Err(report_data_err("wrong data format")),
-        }
-    };
-    let parse = |buffer: &[u8], radix: u32| match str::from_utf8(buffer) {
-        Ok(s) => match u32::from_str_radix(s, radix) {
-            Ok(v) => Ok(v),
-            Err(e) => Err(report_data_err(e)),
-        },
-        Err(e) => Err(report_data_err(e)),
-    };
-
-    let end_pos = find(buffer, 0, b' ')?;
-    let port = parse(&buffer[..end_pos], 10)?;
-
-    if (1..=65535).contains(&port)
-        || !buffer[end_pos..].starts_with(b" s ")
-        || buffer.len() < end_pos + 3 + 35 + 1
-    {
-        return Err(report_data_err("wrong data format"));
-    }
-
-    let mut start_pos = end_pos + 3;
-    let mut nounce = [0u32; 4];
-    for (pos, n) in nounce.iter_mut().enumerate() {
-        *n = parse(&buffer[start_pos..start_pos + 4], 16)?;
-        if pos < 3 {
-            if buffer[start_pos + 4] != b'-' {
-                return Err(report_data_err("wrong data format"));
-            }
-        } else if buffer[start_pos + 4] != b'x' {
-            return Err(report_data_err("wrong data format"));
-        }
-        start_pos += 5;
-    }
-    // It's on purpose to ignore endianess.
-    Ok((port as u16, unsafe { mem::transmute(nounce) }))
-}
-
-async fn load_port_nounce(path: &str) -> io::Result<(u16, [u8; 16])> {
-    if !Path::new(&path).exists() {
+/// Loads a libassuan socket file: "<port>\n" followed by a 16 byte nonce.
+async fn load_port_nonce(path: &str) -> io::Result<Nonce> {
+    if !Path::new(path).exists() {
         ping_gpg_agent().await?;
     }
-    let mut f = File::open(&path.replace('\\', "/")).await?;
-    let mut buffer = Vec::with_capacity(50);
-    f.read_to_end(&mut buffer).await?;
+    let buffer = tokio::fs::read(path.replace('\\', "/")).await?;
     if buffer.starts_with(b"!<socket >") {
-        return load_cygwin_port_nounce(&buffer[10..]);
+        return Err(data_err(
+            "cygwin/msys socket files are not supported, use Gpg4win's gpg-agent",
+        ));
+    }
+    if buffer.len() <= 16 {
+        return Err(data_err("socket file too short"));
     }
     let (left, right) = buffer.split_at(buffer.len() - 16);
-    let to_port: u16 = str::from_utf8(left).unwrap().trim().parse().unwrap();
-    let mut nounce = [0; 16];
-    unsafe {
-        ptr::copy_nonoverlapping(right.as_ptr(), nounce.as_mut_ptr(), 16);
-    }
-    Ok((to_port, nounce))
+    let port = str::from_utf8(left)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .ok_or_else(|| data_err("invalid port in socket file"))?;
+    Ok((port, right.try_into().unwrap()))
 }
 
-async fn copy(
-    tag: &str,
-    from: &mut (impl AsyncRead + Unpin),
-    to: &mut (impl AsyncWrite + Unpin),
-) -> io::Result<u64> {
-    let mut buf = vec![0; 4096];
-    let mut total = 0;
-    loop {
-        let cnt = from.read(&mut buf).await?;
-        if cnt == 0 {
-            to.shutdown().await?;
-            unsafe {
-                ptr::write_bytes(buf.as_mut_ptr(), 0, 4096);
-            }
-            return Ok(total);
+async fn current_nonce(meta: &Mutex<AgentMeta>) -> io::Result<Nonce> {
+    let mut m = meta.lock().await;
+    if let Some(args) = m.args {
+        return Ok(args);
+    }
+    if m.path.is_none() {
+        m.path = Some(load_gpg_socket_path().await?);
+    }
+    let args = load_port_nonce(m.path.as_ref().unwrap()).await?;
+    m.args = Some(args);
+    Ok(args)
+}
+
+/// Connects to the agent and waits for its greeting. The agent closes the connection without
+/// greeting when the nonce is stale, so a successful return means the nonce was accepted.
+async fn connect_agent((port, nonce): Nonce) -> io::Result<(TcpStream, Vec<u8>)> {
+    let handshake = async {
+        let mut agent = TcpStream::connect(("127.0.0.1", port)).await?;
+        agent.write_all(&nonce).await?;
+        let mut greeting = vec![0; 1024];
+        let n = agent.read(&mut greeting).await?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "agent closed connection, stale nonce?",
+            ));
         }
-        total += cnt as u64;
-        trace!("{} {:?}", tag, String::from_utf8_lossy(&buf[..cnt]));
-        to.write_all(&buf[..cnt]).await?;
-    }
+        greeting.truncate(n);
+        Ok((agent, greeting))
+    };
+    timeout(Duration::from_secs(10), handshake)
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "agent did not greet"))?
 }
 
-async fn delegate(mut from: TcpStream, to_port: u16, nounce: [u8; 16]) -> io::Result<()> {
-    let mut delegate = match TcpStream::connect(("127.0.0.1", to_port)).await {
-        Ok(s) => s,
-        Err(e) => {
-            // It's possible that gpg-client was killed and leave stale meta untouched.
-            // Reping agent to make it startup.
-            let _ = ping_gpg_agent().await;
-            return Err(e);
+async fn delegate(mut client: TcpStream, meta: Arc<Mutex<AgentMeta>>) -> io::Result<()> {
+    let mut retried = false;
+    let (mut agent, greeting) = loop {
+        let args = current_nonce(&meta).await?;
+        match connect_agent(args).await {
+            Ok(conn) => break conn,
+            Err(e) => {
+                // gpg-agent was likely restarted, reload its port and nonce.
+                let mut m = meta.lock().await;
+                if m.args == Some(args) {
+                    m.args = None;
+                }
+                drop(m);
+                if retried {
+                    return Err(e);
+                }
+                warn!("failed to connect to agent, retrying: {}", e);
+                let _ = ping_gpg_agent().await;
+                retried = true;
+            }
         }
     };
-    trace!("--> {:?}", String::from_utf8_lossy(&nounce));
-    delegate.write_all(&nounce).await?;
-    delegate.flush().await?;
-
-    let (mut source_read, mut source_write) = from.split();
-    let (mut target_read, mut target_write) = delegate.split();
-    let s2t = copy("-->", &mut source_read, &mut target_write);
-    let t2s = copy("<--", &mut target_read, &mut source_write);
-    let (received, replied) = tokio::join!(s2t, t2s);
-    debug!(
-        "connection finished, received {}, replied {}",
-        received?, replied?
-    );
+    client.write_all(&greeting).await?;
+    match tokio::io::copy_bidirectional(&mut client, &mut agent).await {
+        Ok((received, replied)) => debug!(
+            "connection finished, received {}, replied {}",
+            received,
+            replied + greeting.len() as u64
+        ),
+        // Peers often reset instead of closing gracefully once the session is over.
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+            ) =>
+        {
+            debug!("connection reset: {}", e)
+        }
+        Err(e) => return Err(e),
+    }
     Ok(())
 }
 
@@ -169,32 +154,33 @@ async fn delegate(mut from: TcpStream, to_port: u16, nounce: [u8; 16]) -> io::Re
 ///
 /// `to_path` should point to the path of gnupg UDS.
 pub async fn bridge(from_addr: String, to_path: Option<String>) -> io::Result<()> {
+    let listener = TcpListener::bind(&from_addr).await?;
+    // Every client gets the agent's nonce injected, so never expose it beyond this machine.
+    if !listener.local_addr()?.ip().is_loopback() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing to listen on non-loopback address {}", from_addr),
+        ));
+    }
     // Attempt to setup gpg-agent if it's not up yet.
     let _ = ping_gpg_agent().await;
-    let listener = TcpListener::bind(&from_addr).await?;
     let meta = Arc::new(Mutex::new(AgentMeta {
         path: to_path,
         args: None,
     }));
     loop {
-        let (conn, _) = listener.accept().await?;
-
-        let meta = meta.clone();
-        let (port, nounce) = {
-            let mut m = meta.lock().await;
-            if m.args.is_none() {
-                if m.path.is_none() {
-                    m.path = Some(load_gpg_socket_path().await?);
-                }
-                m.args = Some(load_port_nounce(m.path.as_ref().unwrap()).await?);
+        let conn = match listener.accept().await {
+            Ok((conn, _)) => conn,
+            Err(e) => {
+                error!("failed to accept connection: {}", e);
+                sleep(Duration::from_millis(100)).await;
+                continue;
             }
-            m.args.unwrap()
         };
-
+        let meta = meta.clone();
         tokio::spawn(async move {
-            if let Err(e) = delegate(conn, port, nounce).await {
-                error!("failed to delegate stream: {:?}", e);
-                meta.lock().await.args.take();
+            if let Err(e) = delegate(conn, meta).await {
+                error!("failed to delegate stream: {}", e);
             }
         });
     }
