@@ -36,6 +36,9 @@ This version simplifies the codebase by removing the support for `--ssh`.
 
     If you have customized extra socket localtion, you set the path using `--extra-socket`.
 
+    Only loopback addresses are accepted. Note that any local process, including other users' on a
+    shared machine, can reach your agent's extra socket through the bridge.
+
 Now you are all set, requests to gpg agent on remote should be able to forward to your local.
 
 ## Why invent the wheel
