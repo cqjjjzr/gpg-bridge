@@ -1,6 +1,10 @@
 # gpg-bridge
 A bridge connects openssh-portable and GnuPG on Windows.
 
+A fork of BusyJay's gpg-bridge at : https://github.com/BusyJay/gpg-bridge
+
+This version simplifies the codebase by removing the support for `--ssh`.
+
 ## Usage
 
 1. Install it on your System.
@@ -55,34 +59,5 @@ There are several gotchas if not using bridge to forward gpg agent on Windows. S
 
     GnuPG on Windows has not utilized native UDS support yet. It simulates a UDS using a TCP stream socket with
     customized connect step. So without extra tools, you can't really connect openssh-portable to GnuPG.
-
-## Using GnuPG Agent as ssh agent
-
-GnuPG Agent supports OpenSSH Agent protocol. This tool also supports forwarding ssh queries by utilizing putty
-protocols.
-
-1. To forward it as ssh agent, you need to ensure `--enable-putty-support` is configured for gpg client. Or you
-   can put it into the configuration files, `homedir/gpg-agent.conf`. `homedir` can be found by
-   `gpgconf --list-dir homedir`.
-
-    ```
-    enable-putty-support
-    ```
-
-2. Then pass `--ssh \\.\pipe\gpg-bridge-ssh` to gpg-bridge.
-
-    ```
-    ~/.cargo/bin/gpg-bridge --ssh \\.\pipe\gpg-bridge-ssh
-    ```
-
-    This can also be used with extra socket at the same time.
-
-    ```
-    ~/.cargo/bin/gpg-bridge --extra 127.0.0.1:4321 --ssh \\.\pipe\gpg-bridge-ssh
-    ```
-
-3. Now let OpenSSH to use gpg agent by setting environment variable `SSH_AUTH_SOCK` to `\\.\pipe\gpg-bridge-ssh`.
-
-The string "gpg-bridge-ssh" can be changed to anything you want, just make sure it's consistent everywhere.
 
 [1]: https://docs.github.com/en/actions/managing-workflow-runs/downloading-workflow-artifacts

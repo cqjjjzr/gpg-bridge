@@ -1,17 +1,9 @@
-mod ssh;
-mod util;
-
-pub use self::util::other_error;
-use crate::util::{Listener, NamedPipeServerListener, SplitStream};
 use log::{debug, error, trace};
 use std::path::Path;
-use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::{error, io, mem, ptr, str};
 use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::windows::named_pipe::ServerOptions;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command;
 use tokio::sync::Mutex;
@@ -21,25 +13,10 @@ struct AgentMeta {
     args: Option<(u16, [u8; 16])>,
 }
 
-#[derive(Clone, Copy)]
-pub enum SocketType {
-    Ssh,
-    Extra,
-}
-
-impl SocketType {
-    fn name(&self) -> &'static str {
-        match self {
-            SocketType::Ssh => "agent-ssh-socket",
-            SocketType::Extra => "agent-extra-socket",
-        }
-    }
-}
-
-async fn load_gpg_socket_path(ty: SocketType) -> io::Result<String> {
+async fn load_gpg_socket_path() -> io::Result<String> {
     let output = Command::new("gpgconf")
         .arg("--list-dir")
-        .arg(ty.name())
+        .arg("agent-extra-socket")
         .output()
         .await?;
     if !output.status.success() {
@@ -140,10 +117,10 @@ async fn load_port_nounce(path: &str) -> io::Result<(u16, [u8; 16])> {
     Ok((to_port, nounce))
 }
 
-async fn copy<'a>(
+async fn copy(
     tag: &str,
-    from: &mut Pin<Box<dyn AsyncRead + Send + 'a>>,
-    to: &mut Pin<Box<dyn AsyncWrite + Send + 'a>>,
+    from: &mut (impl AsyncRead + Unpin),
+    to: &mut (impl AsyncWrite + Unpin),
 ) -> io::Result<u64> {
     let mut buf = vec![0; 4096];
     let mut total = 0;
@@ -162,7 +139,7 @@ async fn copy<'a>(
     }
 }
 
-async fn delegate(mut from: impl SplitStream, to_port: u16, nounce: [u8; 16]) -> io::Result<()> {
+async fn delegate(mut from: TcpStream, to_port: u16, nounce: [u8; 16]) -> io::Result<()> {
     let mut delegate = match TcpStream::connect(("127.0.0.1", to_port)).await {
         Ok(s) => s,
         Err(e) => {
@@ -176,8 +153,8 @@ async fn delegate(mut from: impl SplitStream, to_port: u16, nounce: [u8; 16]) ->
     delegate.write_all(&nounce).await?;
     delegate.flush().await?;
 
-    let (mut source_read, mut source_write) = from.split_rw();
-    let (mut target_read, mut target_write) = delegate.split_rw();
+    let (mut source_read, mut source_write) = from.split();
+    let (mut target_read, mut target_write) = delegate.split();
     let s2t = copy("-->", &mut source_read, &mut target_write);
     let t2s = copy("<--", &mut target_read, &mut source_write);
     let (received, replied) = tokio::join!(s2t, t2s);
@@ -188,60 +165,26 @@ async fn delegate(mut from: impl SplitStream, to_port: u16, nounce: [u8; 16]) ->
     Ok(())
 }
 
-/// A bridge that forwards all requests from certain stream to gpg-agent on Windows.
+/// A bridge that forwards all requests from a TCP address to gpg-agent extra socket on Windows.
 ///
-/// `to_path` should point to the path of gnupg UDS. `from_addr` can be either TCP address
-/// or Named Pipe.
-// TODO: use trait to unify access.
-pub async fn bridge(ty: SocketType, from_addr: String, to_path: Option<String>) -> io::Result<()> {
+/// `to_path` should point to the path of gnupg UDS.
+pub async fn bridge(from_addr: String, to_path: Option<String>) -> io::Result<()> {
     // Attempt to setup gpg-agent if it's not up yet.
     let _ = ping_gpg_agent().await;
-    // We can also try to guess ':'. But then we can distinguish between named pipe localhost and
-    // invalid tcp address localhost. Force check '\pipe\' can allow those address fail with clear
-    // error.
-    if from_addr.starts_with("\\\\.\\pipe\\") {
-        let server = ServerOptions::new()
-            .first_pipe_instance(true)
-            .create(&from_addr)?;
-        let listener = NamedPipeServerListener::new(server, from_addr);
-        bridge_listener(ty, listener, to_path).await?;
-    } else {
-        let listener = TcpListener::bind(&from_addr).await?;
-        bridge_listener(ty, listener, to_path).await?;
-    }
-    Ok(())
-}
-
-async fn bridge_listener<L>(ty: SocketType, listener: L, to_path: Option<String>) -> io::Result<()>
-where
-    L: Listener,
-    L::Connection: SplitStream + Send + 'static,
-{
-    match ty {
-        SocketType::Extra => bridge_to_stream(listener, to_path).await?,
-        SocketType::Ssh => bridge_to_message(listener).await?,
-    }
-    Ok(())
-}
-
-async fn bridge_to_stream<L>(mut listener: L, to_path: Option<String>) -> io::Result<()>
-where
-    L: Listener,
-    L::Connection: SplitStream + Send + 'static,
-{
+    let listener = TcpListener::bind(&from_addr).await?;
     let meta = Arc::new(Mutex::new(AgentMeta {
         path: to_path,
         args: None,
     }));
     loop {
-        let conn = listener.accept().await?;
+        let (conn, _) = listener.accept().await?;
 
         let meta = meta.clone();
         let (port, nounce) = {
             let mut m = meta.lock().await;
             if m.args.is_none() {
                 if m.path.is_none() {
-                    m.path = Some(load_gpg_socket_path(SocketType::Extra).await?);
+                    m.path = Some(load_gpg_socket_path().await?);
                 }
                 m.args = Some(load_port_nounce(m.path.as_ref().unwrap()).await?);
             }
@@ -252,46 +195,6 @@ where
             if let Err(e) = delegate(conn, port, nounce).await {
                 error!("failed to delegate stream: {:?}", e);
                 meta.lock().await.args.take();
-            }
-        });
-    }
-}
-
-// For now, forwarding ssh agent requests can only be done using IPC messages. gpg
-// ssh agent seems to do security trick on tcp stream and fail to receive anything.
-async fn delegate_ssh(mut from: impl SplitStream) -> io::Result<()> {
-    let (mut source_read, mut source_write) = from.split_rw();
-    let mut handler = ssh::Handler::new().await?;
-    while let Some(resp) = handler.process_one(&mut source_read).await? {
-        trace!("get {:?}", String::from_utf8_lossy(resp));
-        source_write.write_all(resp).await?;
-    }
-    debug!(
-        "connection finished, received {}, replied {}",
-        handler.received(),
-        handler.replied()
-    );
-    Ok(())
-}
-
-async fn bridge_to_message<L>(mut listener: L) -> io::Result<()>
-where
-    L: Listener,
-    L::Connection: SplitStream + Send + 'static,
-{
-    let reload = Arc::new(AtomicBool::new(false));
-    loop {
-        let conn = listener.accept().await?;
-
-        if reload.load(Ordering::SeqCst) {
-            ping_gpg_agent().await?;
-            reload.store(false, Ordering::SeqCst);
-        }
-        let reload = reload.clone();
-        tokio::spawn(async move {
-            if let Err(e) = delegate_ssh(conn).await {
-                error!("failed to delegate message: {:?}", e);
-                reload.store(true, Ordering::SeqCst);
             }
         });
     }
