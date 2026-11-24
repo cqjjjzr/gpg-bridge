@@ -1,6 +1,4 @@
 use clap::Parser;
-use gpg_bridge::other_error;
-use gpg_bridge::SocketType;
 use std::os::windows::process::CommandExt;
 use std::process::Command;
 use std::{env, io};
@@ -9,12 +7,9 @@ use std::{env, io};
 #[command(name = "gpg-bridge")]
 #[command(version, about)]
 struct GpgBridge {
-    /// Sets the listenning address to bridge the ssh socket
-    #[arg(long, value_name("ADDRESS"), required_unless_present("extra"))]
-    ssh: Option<String>,
     /// Sets the listenning to bridge the extra socket
-    #[arg(long, value_name("ADDRESS"), required_unless_present("ssh"))]
-    extra: Option<String>,
+    #[arg(long, value_name("ADDRESS"))]
+    extra: String,
     /// Sets the path to gnupg extra socket optionaly
     #[arg(long, value_name("PATH"))]
     extra_socket: Option<String>,
@@ -43,22 +38,5 @@ async fn main() -> io::Result<()> {
             .map(|_| ());
     }
 
-    let ssh_from = cfg.ssh;
-    let ssh_task = async move {
-        if let Some(from_addr) = ssh_from {
-            return gpg_bridge::bridge(SocketType::Ssh, from_addr, None).await;
-        }
-        Ok(())
-    };
-    let (extra_from, extra_to) = (cfg.extra, cfg.extra_socket);
-    let extra_task = async move {
-        if let Some(from_addr) = extra_from {
-            return gpg_bridge::bridge(SocketType::Extra, from_addr, extra_to).await;
-        }
-        Ok(())
-    };
-    match tokio::try_join!(ssh_task, extra_task) {
-        Ok(_) => Ok(()),
-        Err(e) => return Err(other_error(format!("failed to join tasks {:?}", e))),
-    }
+    gpg_bridge::bridge(cfg.extra, cfg.extra_socket).await
 }
