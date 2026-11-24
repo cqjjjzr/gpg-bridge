@@ -41,6 +41,27 @@ This version simplifies the codebase by removing the support for `--ssh`.
 
 Now you are all set, requests to gpg agent on remote should be able to forward to your local.
 
+## Running in background
+
+`gpg-bridgew.exe` is the same program without a console window. Use it with `--log-file` to keep logs
+(set `RUST_LOG=debug` for more detail). To start it at logon with Task Scheduler, run in PowerShell:
+
+```powershell
+$action = New-ScheduledTaskAction -Execute "$env:USERPROFILE\.cargo\bin\gpg-bridgew.exe" `
+    -Argument "--extra 127.0.0.1:4321 --log-file `"$env:LOCALAPPDATA\gpg-bridge.log`""
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User ([Security.Principal.WindowsIdentity]::GetCurrent().Name)
+# Defaults would stop it after 3 days or on battery.
+$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+Register-ScheduledTask gpg-bridge -Action $action -Trigger $trigger -Settings $settings
+Start-ScheduledTask gpg-bridge
+```
+
+Task Scheduler then shows whether it is running, its exit code, and can stop it. Remove it with
+`Unregister-ScheduledTask gpg-bridge`.
+
+A Windows service is not a good fit: services run in session 0, apart from the per-user gpg-agent and
+its pinentry.
+
 ## Why invent the wheel
 
 There are several gotchas if not using bridge to forward gpg agent on Windows. See PowerShell/Win32-OpenSSH#1564.

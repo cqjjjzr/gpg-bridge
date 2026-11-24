@@ -1,6 +1,8 @@
+use clap::Parser;
 use log::{debug, error, warn};
 use std::convert::TryInto;
-use std::path::Path;
+use std::fs::OpenOptions;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use std::{io, str};
@@ -9,6 +11,52 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout};
+use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+
+#[derive(Parser)]
+#[command(name = "gpg-bridge")]
+#[command(version, about)]
+struct Args {
+    /// Sets the listenning to bridge the extra socket
+    #[arg(long, value_name("ADDRESS"))]
+    extra: String,
+    /// Sets the path to gnupg extra socket optionaly
+    #[arg(long, value_name("PATH"))]
+    extra_socket: Option<String>,
+    /// Appends logs to this file instead of stderr
+    #[arg(long, value_name("PATH"))]
+    log_file: Option<PathBuf>,
+}
+
+pub fn run() -> io::Result<()> {
+    let args = Args::parse();
+    let mut logger =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"));
+    if let Some(path) = &args.log_file {
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        logger
+            .target(env_logger::Target::Pipe(Box::new(file)))
+            .write_style(env_logger::WriteStyle::Never);
+    }
+    logger.init();
+
+    let res = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(bridge(args.extra, args.extra_socket));
+    if let (Err(e), Some(_)) = (&res, &args.log_file) {
+        // gpg-bridgew has no stderr, make sure fatal errors reach the log file.
+        error!("{}", e);
+    }
+    res
+}
+
+/// Runs gpg tools without a console window, which would pop up when we have none.
+fn gpg_command(program: &str) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd
+}
 
 type Nonce = (u16, [u8; 16]);
 
@@ -18,7 +66,7 @@ struct AgentMeta {
 }
 
 async fn load_gpg_socket_path() -> io::Result<String> {
-    let output = Command::new("gpgconf")
+    let output = gpg_command("gpgconf")
         .arg("--list-dirs")
         .arg("agent-extra-socket")
         .output()
@@ -32,8 +80,8 @@ async fn load_gpg_socket_path() -> io::Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
-pub async fn ping_gpg_agent() -> io::Result<()> {
-    let output = Command::new("gpg-connect-agent")
+async fn ping_gpg_agent() -> io::Result<()> {
+    let output = gpg_command("gpg-connect-agent")
         .arg("/bye")
         .output()
         .await?;
@@ -151,7 +199,7 @@ async fn delegate(mut client: TcpStream, meta: Arc<Mutex<AgentMeta>>) -> io::Res
 /// A bridge that forwards all requests from a TCP address to gpg-agent extra socket on Windows.
 ///
 /// `to_path` should point to the path of gnupg UDS.
-pub async fn bridge(from_addr: String, to_path: Option<String>) -> io::Result<()> {
+async fn bridge(from_addr: String, to_path: Option<String>) -> io::Result<()> {
     // Every client gets the agent's nonce injected, so never expose it beyond this machine.
     let addrs: Vec<_> = tokio::net::lookup_host(&from_addr).await?.collect();
     if let Some(addr) = addrs.iter().find(|a| !a.ip().is_loopback()) {
