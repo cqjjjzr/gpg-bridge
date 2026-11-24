@@ -1,0 +1,33 @@
+name: Publish release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to create, e.g. v0.2.0
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build
+        run: cargo build --release --locked
+      - name: Package
+        shell: pwsh
+        env:
+          TAG: ${{ inputs.tag }}
+        run: >-
+          Compress-Archive -DestinationPath "gpg-bridge-$env:TAG-windows-x64.zip"
+          -Path target/release/gpg-bridge.exe, target/release/gpg-bridgew.exe, README.md, LICENSE
+      - name: Upload to GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: gh release create "$TAG" "gpg-bridge-$TAG-windows-x64.zip" --target "$GITHUB_SHA" --title "$TAG" --generate-notes
